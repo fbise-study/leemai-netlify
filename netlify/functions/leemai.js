@@ -1,237 +1,161 @@
-// FIXED Netlify Function v2 - Better error handling
 exports.handler = async function (event, context) {
-  
-  // CORS headers
+
   const headers = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Content-Type': 'application/json'
   };
 
-  // Handle OPTIONS preflight
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 200,
-      headers,
-      body: ''
-    };
+    return { statusCode: 200, headers, body: '' };
   }
 
-  // Only allow POST
-  if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      headers,
-      body: JSON.stringify({ error: "Only POST allowed" })
-    };
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, headers, body: JSON.stringify({ error: 'Only POST allowed' }) };
   }
 
   try {
-    // Parse request body
-    let requestBody;
-    try {
-      requestBody = JSON.parse(event.body || "{}");
-    } catch (parseError) {
-      console.error('JSON parse error:', parseError);
-      return {
-        statusCode: 400,
-        headers,
-        body: JSON.stringify({ error: "Invalid JSON in request body" })
-      };
+    const { question, language } = JSON.parse(event.body || '{}');
+
+    if (!question || !question.trim()) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Question is required' }) };
     }
 
-    const { question, language } = requestBody;
-
-    // Validate question
-    if (!question || typeof question !== 'string' || question.trim().length === 0) {
-      return {
-        statusCode: 400,
-        headers,
-        body: JSON.stringify({ error: "Question is required and must be a non-empty string" })
-      };
-    }
-
-    console.log('Received question:', question);
-    console.log('Language:', language);
-
-    // Check for HF_TOKEN
     if (!process.env.HF_TOKEN) {
-      console.error('HF_TOKEN not found in environment variables');
+      console.error('HF_TOKEN not set');
       return {
-        statusCode: 500,
+        statusCode: 200,
         headers,
-        body: JSON.stringify({ 
-          error: "Configuration error",
-          answer: "The AI service is not properly configured. Please contact support."
-        })
+        body: JSON.stringify({ answer: 'Service not configured. Please contact support.' })
       };
     }
 
-    const prompt = `You are LeemAI, a helpful study assistant for FBISE students in Pakistan.
-Explain concepts in a simple and clear way suitable for high school students.
-Answer in ${language === "ur" ? "Urdu" : "simple English"}.
-Do NOT help with cheating or provide exam answers.
+    const isUrdu = language === 'ur';
 
-Question: ${question}
+    const prompt = `<s>[INST] You are LeemAI, a helpful study assistant for FBISE students in Pakistan (classes 9-12).
+Give clear, simple, accurate answers suitable for high school students.
+${isUrdu ? 'Answer in Urdu language.' : 'Answer in simple English.'}
+Do not help with cheating.
 
-Answer:`;
+${question} [/INST]`;
 
-    console.log('Calling Hugging Face API...');
+    // Working models to try in order
+    const models = [
+      'mistralai/Mistral-7B-Instruct-v0.3',
+      'HuggingFaceH4/zephyr-7b-beta',
+      'google/gemma-2-2b-it',
+      'microsoft/Phi-3-mini-4k-instruct'
+    ];
 
-    // Call Hugging Face API with timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000); // 25 second timeout
+    let answer = null;
+    let lastError = null;
 
-    let hfResponse;
-    try {
-      hfResponse = await fetch(
-        "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2",
-        {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${process.env.HF_TOKEN}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            inputs: prompt,
-            parameters: {
-              max_new_tokens: 400,
-              temperature: 0.7,
-              return_full_text: false,
-              top_p: 0.95
-            }
-          }),
-          signal: controller.signal
+    for (const model of models) {
+      try {
+        console.log('Trying model:', model);
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 20000);
+
+        const response = await fetch(
+          `https://api-inference.huggingface.co/models/${model}`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${process.env.HF_TOKEN}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              inputs: prompt,
+              parameters: {
+                max_new_tokens: 400,
+                temperature: 0.7,
+                return_full_text: false,
+                top_p: 0.9
+              }
+            }),
+            signal: controller.signal
+          }
+        );
+
+        clearTimeout(timeout);
+
+        console.log(`Model ${model} status:`, response.status);
+
+        if (!response.ok) {
+          const errText = await response.text();
+          console.log(`Model ${model} error:`, errText);
+          lastError = `${model}: HTTP ${response.status}`;
+          continue; // Try next model
         }
-      );
-    } catch (fetchError) {
-      clearTimeout(timeoutId);
-      console.error('Fetch error:', fetchError);
-      
-      if (fetchError.name === 'AbortError') {
-        return {
-          statusCode: 504,
-          headers,
-          body: JSON.stringify({ 
-            error: "Request timeout",
-            answer: "The AI took too long to respond. Please try asking a simpler question."
-          })
-        };
+
+        const data = await response.json();
+        console.log(`Model ${model} response:`, JSON.stringify(data).substring(0, 200));
+
+        // Handle model loading
+        if (data.error && data.error.includes('loading')) {
+          lastError = `${model}: still loading`;
+          continue;
+        }
+
+        // Extract answer
+        let raw = '';
+        if (Array.isArray(data) && data[0]?.generated_text) {
+          raw = data[0].generated_text;
+        } else if (data.generated_text) {
+          raw = data.generated_text;
+        }
+
+        if (raw && raw.trim().length > 0) {
+          // Clean up any prompt echo
+          raw = raw.replace(prompt, '').trim();
+          // Remove [INST] tags if echoed
+          raw = raw.replace(/<s>\[INST\].*?\[\/INST\]/gs, '').trim();
+          answer = raw;
+          console.log('Got answer from model:', model);
+          break; // Success
+        }
+
+        lastError = `${model}: empty response`;
+
+      } catch (err) {
+        console.log(`Model ${model} threw:`, err.message);
+        lastError = `${model}: ${err.message}`;
+        continue;
       }
-      
-      throw fetchError;
     }
 
-    clearTimeout(timeoutId);
-
-    console.log('HF Response status:', hfResponse.status);
-
-    // Check if API call was successful
-    if (!hfResponse.ok) {
-      const errorText = await hfResponse.text();
-      console.error('HF API error:', hfResponse.status, errorText);
-      
-      // Handle specific error cases
-      if (hfResponse.status === 503) {
-        return {
-          statusCode: 200,
-          headers,
-          body: JSON.stringify({ 
-            answer: "The AI model is currently loading. Please wait a moment and try again. (This is normal for the first request)"
-          })
-        };
+    if (answer && answer.length > 0) {
+      // Trim to reasonable length
+      if (answer.length > 1500) {
+        answer = answer.substring(0, 1500) + '...';
       }
-      
-      if (hfResponse.status === 401) {
-        return {
-          statusCode: 500,
-          headers,
-          body: JSON.stringify({ 
-            error: "Authentication error",
-            answer: "There's a configuration issue with the AI service. Please contact support."
-          })
-        };
-      }
-      
+
       return {
         statusCode: 200,
         headers,
-        body: JSON.stringify({ 
-          answer: `Unable to get response from AI (Error ${hfResponse.status}). Please try again.`
-        })
+        body: JSON.stringify({ answer })
       };
     }
 
-    // Parse response
-    let data;
-    try {
-      data = await hfResponse.json();
-    } catch (jsonError) {
-      console.error('JSON parse error from HF:', jsonError);
-      const textResponse = await hfResponse.text();
-      console.error('Raw response:', textResponse);
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({ 
-          answer: "Received an invalid response from AI. Please try again."
-        })
-      };
-    }
-
-    console.log('HF Response data:', JSON.stringify(data).substring(0, 200));
-
-    // Extract answer
-    let answer = "I couldn't generate a proper response. Please try rephrasing your question.";
-
-    if (Array.isArray(data) && data.length > 0) {
-      if (data[0].generated_text) {
-        answer = data[0].generated_text
-          .replace(prompt, "")
-          .trim();
-      } else if (data[0].error) {
-        console.error('HF returned error:', data[0].error);
-        answer = "The AI model encountered an error. Please try again.";
-      }
-    } else if (data.generated_text) {
-      answer = data.generated_text
-        .replace(prompt, "")
-        .trim();
-    } else if (data.error) {
-      console.error('HF returned error:', data.error);
-      answer = "The AI model encountered an error. Please try again.";
-    }
-
-    // Clean up answer
-    if (answer.length === 0) {
-      answer = "I couldn't generate a response. Please try asking your question differently.";
-    }
-
-    // Limit answer length
-    if (answer.length > 2000) {
-      answer = answer.substring(0, 2000) + "...";
-    }
-
-    console.log('Returning answer (length):', answer.length);
-
-    // Return success
+    // All models failed
+    console.error('All models failed. Last error:', lastError);
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify({ answer })
+      body: JSON.stringify({
+        answer: 'The AI models are currently unavailable or loading. Please try again in 30 seconds. If this keeps happening, the service may be under maintenance.'
+      })
     };
 
-  } catch (error) {
-    console.error('Unexpected error:', error);
-    console.error('Error stack:', error.stack);
-    
+  } catch (err) {
+    console.error('Handler error:', err);
     return {
-      statusCode: 200, // Return 200 to avoid frontend errors
+      statusCode: 200,
       headers,
-      body: JSON.stringify({ 
-        answer: "An unexpected error occurred. Please try again. If the problem persists, contact support.",
-        error: error.message
+      body: JSON.stringify({
+        answer: 'An unexpected error occurred. Please try again.'
       })
     };
   }
