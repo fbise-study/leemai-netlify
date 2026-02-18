@@ -1,5 +1,9 @@
-exports.handler = async function (event, context) {
+// Netlify Function: /netlify/functions/leemai.js
+// This keeps your API key secure on the server
 
+exports.handler = async (event, context) => {
+  
+  // CORS headers for browser access
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
@@ -7,155 +11,169 @@ exports.handler = async function (event, context) {
     'Content-Type': 'application/json'
   };
 
+  // Handle preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 200, headers, body: '' };
   }
 
+  // Only POST allowed
   if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, headers, body: JSON.stringify({ error: 'Only POST allowed' }) };
+    return {
+      statusCode: 405,
+      headers,
+      body: JSON.stringify({ error: 'Method not allowed' })
+    };
   }
 
   try {
+    // Parse request
     const { question, language } = JSON.parse(event.body || '{}');
 
-    if (!question || !question.trim()) {
-      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Question is required' }) };
-    }
-
-    if (!process.env.HF_TOKEN) {
-      console.error('HF_TOKEN not set');
+    // Validate input
+    if (!question || typeof question !== 'string' || question.trim().length === 0) {
       return {
-        statusCode: 200,
+        statusCode: 400,
         headers,
-        body: JSON.stringify({ answer: 'Service not configured. Please contact support.' })
+        body: JSON.stringify({ error: 'Question is required' })
       };
     }
 
+    // Check for API key in environment
+    if (!process.env.AIML_API_KEY) {
+      console.error('AIML_API_KEY not set in environment');
+      return {
+        statusCode: 500,
+        headers,
+        body: JSON.stringify({ 
+          answer: 'Service configuration error. Please contact support.' 
+        })
+      };
+    }
+
+    console.log('Processing question:', question.substring(0, 50) + '...');
+    console.log('Language:', language || 'en');
+
+    // Build prompt
     const isUrdu = language === 'ur';
+    const systemPrompt = `You are LeemAI, an intelligent study assistant for FBISE (Federal Board) students in Pakistan studying classes 9-12.
 
-    const prompt = `<s>[INST] You are LeemAI, a helpful study assistant for FBISE students in Pakistan (classes 9-12).
-Give clear, simple, accurate answers suitable for high school students.
-${isUrdu ? 'Answer in Urdu language.' : 'Answer in simple English.'}
-Do not help with cheating.
+Your role:
+- Explain concepts clearly and simply
+- Provide accurate educational information
+- Help with Mathematics, Physics, Chemistry, Biology, English, Urdu, Islamiyat, Pakistan Studies
+- Give study tips and exam preparation advice
+- Be encouraging and supportive
 
-${question} [/INST]`;
+Important rules:
+- ${isUrdu ? 'Answer in clear Urdu (اردو)' : 'Answer in simple, clear English'}
+- Keep answers concise (2-4 paragraphs max)
+- Do NOT help with cheating or provide direct exam answers
+- If you don't know something, say so honestly
+- For complex topics, break them down step by step`;
 
-    // Working models to try in order
-    const models = [
-      'mistralai/Mistral-7B-Instruct-v0.3',
-      'HuggingFaceH4/zephyr-7b-beta',
-      'google/gemma-2-2b-it',
-      'microsoft/Phi-3-mini-4k-instruct'
-    ];
+    const userMessage = `${question}`;
 
-    let answer = null;
-    let lastError = null;
+    // Call AI/ML API
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-    for (const model of models) {
-      try {
-        console.log('Trying model:', model);
+    const response = await fetch('https://api.aimlapi.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.AIML_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini', // Fast and cost-effective
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage }
+        ],
+        max_tokens: 500,
+        temperature: 0.7
+      }),
+      signal: controller.signal
+    });
 
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 20000);
+    clearTimeout(timeout);
 
-        const response = await fetch(
-          `https://api-inference.huggingface.co/models/${model}`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${process.env.HF_TOKEN}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              inputs: prompt,
-              parameters: {
-                max_new_tokens: 400,
-                temperature: 0.7,
-                return_full_text: false,
-                top_p: 0.9
-              }
-            }),
-            signal: controller.signal
-          }
-        );
+    console.log('AI/ML API response status:', response.status);
 
-        clearTimeout(timeout);
+    // Handle API errors
+    if (!response.ok) {
+      const errorData = await response.text();
+      console.error('AI/ML API error:', response.status, errorData);
 
-        console.log(`Model ${model} status:`, response.status);
-
-        if (!response.ok) {
-          const errText = await response.text();
-          console.log(`Model ${model} error:`, errText);
-          lastError = `${model}: HTTP ${response.status}`;
-          continue; // Try next model
-        }
-
-        const data = await response.json();
-        console.log(`Model ${model} response:`, JSON.stringify(data).substring(0, 200));
-
-        // Handle model loading
-        if (data.error && data.error.includes('loading')) {
-          lastError = `${model}: still loading`;
-          continue;
-        }
-
-        // Extract answer
-        let raw = '';
-        if (Array.isArray(data) && data[0]?.generated_text) {
-          raw = data[0].generated_text;
-        } else if (data.generated_text) {
-          raw = data.generated_text;
-        }
-
-        if (raw && raw.trim().length > 0) {
-          // Clean up any prompt echo
-          raw = raw.replace(prompt, '').trim();
-          // Remove [INST] tags if echoed
-          raw = raw.replace(/<s>\[INST\].*?\[\/INST\]/gs, '').trim();
-          answer = raw;
-          console.log('Got answer from model:', model);
-          break; // Success
-        }
-
-        lastError = `${model}: empty response`;
-
-      } catch (err) {
-        console.log(`Model ${model} threw:`, err.message);
-        lastError = `${model}: ${err.message}`;
-        continue;
+      if (response.status === 401) {
+        return {
+          statusCode: 500,
+          headers,
+          body: JSON.stringify({ 
+            answer: 'Authentication error. Please check API configuration.' 
+          })
+        };
       }
-    }
 
-    if (answer && answer.length > 0) {
-      // Trim to reasonable length
-      if (answer.length > 1500) {
-        answer = answer.substring(0, 1500) + '...';
+      if (response.status === 429) {
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({ 
+            answer: 'Too many requests. Please wait a moment and try again.' 
+          })
+        };
       }
 
       return {
         statusCode: 200,
         headers,
-        body: JSON.stringify({ answer })
+        body: JSON.stringify({ 
+          answer: `Service temporarily unavailable (${response.status}). Please try again.` 
+        })
       };
     }
 
-    // All models failed
-    console.error('All models failed. Last error:', lastError);
+    // Parse response
+    const data = await response.json();
+    console.log('AI/ML API response received');
+
+    // Extract answer
+    let answer = 'Unable to generate response. Please try again.';
+    
+    if (data.choices && data.choices[0] && data.choices[0].message) {
+      answer = data.choices[0].message.content.trim();
+    }
+
+    // Log success
+    console.log('Answer generated, length:', answer.length);
+
+    // Return success
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify({
-        answer: 'The AI models are currently unavailable or loading. Please try again in 30 seconds. If this keeps happening, the service may be under maintenance.'
-      })
+      body: JSON.stringify({ answer })
     };
 
-  } catch (err) {
-    console.error('Handler error:', err);
+  } catch (error) {
+    console.error('Function error:', error.name, error.message);
+
+    // Handle timeout
+    if (error.name === 'AbortError') {
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ 
+          answer: 'Request timeout. Please try asking a simpler question.' 
+        })
+      };
+    }
+
+    // Generic error
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify({
-        answer: 'An unexpected error occurred. Please try again.'
+      body: JSON.stringify({ 
+        answer: 'An unexpected error occurred. Please try again.' 
       })
     };
   }
